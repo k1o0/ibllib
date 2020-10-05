@@ -1,6 +1,14 @@
+import json
+import os
+import os.path as op
+from pathlib import Path
+
 import globus_sdk as globus
 from ibllib.io import params
 
+
+# ibllib util functions
+# ------------------------------------------------------------------------------------------------
 
 def _login(globus_client_id, refresh_tokens=False):
 
@@ -44,3 +52,93 @@ def login_auto(globus_client_id, str_app='globus'):
     client.oauth2_start_flow(refresh_tokens=True)
     authorizer = globus.RefreshTokenAuthorizer(token.transfer_rt, client)
     return globus.TransferClient(authorizer=authorizer)
+
+
+# Login functions coming from alyx
+# ------------------------------------------------------------------------------------------------
+
+def globus_client_id():
+    return params.read('one_params').GLOBUS_CLIENT_ID
+
+
+def get_config_path(path=''):
+    path = op.expanduser(op.join('~/.ibllib', path))
+    os.makedirs(op.dirname(path), exist_ok=True)
+    return path
+
+
+def create_globus_client():
+    client = globus.NativeAppAuthClient(globus_client_id())
+    client.oauth2_start_flow(refresh_tokens=True)
+    return client
+
+
+def create_globus_token():
+    client = create_globus_client()
+    print('Please go to this URL and login: {0}'
+          .format(client.oauth2_get_authorize_url()))
+    get_input = getattr(__builtins__, 'raw_input', input)
+    auth_code = get_input('Please enter the code here: ').strip()
+    token_response = client.oauth2_exchange_code_for_tokens(auth_code)
+    globus_transfer_data = token_response.by_resource_server['transfer.api.globus.org']
+
+    data = dict(transfer_rt=globus_transfer_data['refresh_token'],
+                transfer_at=globus_transfer_data['access_token'],
+                expires_at_s=globus_transfer_data['expires_at_seconds'],
+                )
+    path = get_config_path('globus-token.json')
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def get_globus_transfer_rt():
+    path = get_config_path('globus-token.json')
+    if not op.exists(path):
+        return
+    with open(path, 'r') as f:
+        return json.load(f).get('transfer_rt', None)
+
+
+def globus_transfer_client():
+    transfer_rt = get_globus_transfer_rt()
+    if not transfer_rt:
+        create_globus_token()
+        transfer_rt = get_globus_transfer_rt()
+    client = create_globus_client()
+    authorizer = globus.RefreshTokenAuthorizer(transfer_rt, client)
+    tc = globus.TransferClient(authorizer=authorizer)
+    return tc
+
+
+# Globus wrapper
+# ------------------------------------------------------------------------------------------------
+
+def local_endpoint():
+    path = Path.home().joinpath(".globusonline/lta/client-id.txt")
+    if path.exists():
+        return path.read_text()
+
+
+ENDPOINTS = {
+    'test': ('2bfac104-12b1-11ea-bea5-02fcc9cdd752', '/~/mnt/xvdf/Data/'),
+    'flatiron': ('15f76c0c-10ee-11e8-a7ed-0a448319c2f8', '/~/'),
+    'local': (local_endpoint(), '/~/ssd/ephys/globus/'),
+}
+
+
+class Globus:
+    def __init__(self):
+        self._tc = globus_transfer_client()
+
+    def ls(self, endpoint, path=''):
+        endpoint, root = ENDPOINTS.get(endpoint, endpoint)
+        if not root.endswith('/'):
+            root += '/'
+        if path.startswith('/'):
+            path = path[1:]
+        path = root + path
+        assert '//' not in path
+        out = []
+        for entry in self._tc.operation_ls(endpoint, path=path):
+            out.append((entry['name'], entry['size'] if entry['type'] == 'file' else None))
+        return out
